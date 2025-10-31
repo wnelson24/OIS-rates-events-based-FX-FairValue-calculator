@@ -1,0 +1,83 @@
+# === Rate–FX Imbalance Indicator (Event-driven, Final Version) ===
+# William Nelson | Macro FX Prototype
+
+from fredapi import Fred
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression
+
+# ----------------------------------------------------------
+# 0. Setup
+# ----------------------------------------------------------
+fred = Fred(api_key="FRED_OR_OTHER_RATES_API_KEY")   # <-- paste your valid 32-char FRED key
+
+# ----------------------------------------------------------
+# 1. Download data
+# ----------------------------------------------------------
+fed_funds = fred.get_series("DFF")      # Effective Fed Funds rate (daily)
+us2y = fred.get_series("DGS2")          # 2-year Treasury yield (front-end proxy)
+fx = yf.download("EURUSD=X", start="2020-01-01", auto_adjust=False)["Close"]
+
+# Combine and prepare
+data = pd.concat([fx, fed_funds, us2y], axis=1).dropna()
+data.columns = ["EURUSD", "FedFunds", "US2Y"]
+data["Rate_Spread"] = data["US2Y"] - data["FedFunds"]
+data["dRate_Spread"] = data["Rate_Spread"].diff()
+data["FX_ret"] = data["EURUSD"].pct_change()
+
+# ----------------------------------------------------------
+# 2. Rolling beta (FX per bp of rate repricing)
+# ----------------------------------------------------------
+window = 20
+betas = []
+
+for i in range(window, len(data)):
+    x = data["dRate_Spread"].iloc[i-window:i].values
+    y = data["FX_ret"].iloc[i-window:i].values
+    mask = ~np.isnan(x) & ~np.isnan(y)
+    x, y = x[mask], y[mask]
+
+    if len(x) > 5:
+        x = x.reshape(-1, 1)      # ensure 2-D
+        y = y.reshape(-1, 1)
+        reg = LinearRegression().fit(x, y)
+        betas.append(reg.coef_[0][0])
+    else:
+        betas.append(np.nan)
+
+data["Beta"] = [np.nan]*window + betas
+
+# ----------------------------------------------------------
+# 3. Event filter (policy repricing)
+# ----------------------------------------------------------
+threshold = 0.05  # 5 bp ≈ 0.05 %
+events = data[abs(data["dRate_Spread"]) > threshold].copy()
+
+# ----------------------------------------------------------
+# 4. Compute theoretical fair-value EURUSD
+# ----------------------------------------------------------
+events["FairValue"] = events["EURUSD"].shift(1) * (1 + events["Beta"] * events["dRate_Spread"])
+events["Imbalance"] = events["EURUSD"] - events["FairValue"]
+
+# ----------------------------------------------------------
+# 5. Output summary
+# ----------------------------------------------------------
+out = events[["EURUSD","Rate_Spread","dRate_Spread","Beta","FairValue","Imbalance"]].dropna()
+print("\nRecent rate-repricing events:\n")
+print(out.tail(10).round(6))
+print("\nPositive Imbalance → USD under-priced (dovish bias)")
+print("Negative Imbalance → USD over-priced (hawkish bias)\n")
+
+# ----------------------------------------------------------
+# 6. Plot: actual vs theoretical EURUSD
+# ----------------------------------------------------------
+plt.figure(figsize=(10,5))
+plt.plot(events.index, events["EURUSD"], label="Actual EURUSD", lw=1.5)
+plt.plot(events.index, events["FairValue"], label="Policy-implied EURUSD", lw=1.5, linestyle="--")
+plt.title("Event-Driven USD Imbalance Indicator\n(Fair-Value vs Actual EURUSD)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
